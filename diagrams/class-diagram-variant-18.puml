@@ -1,0 +1,252 @@
+@startuml
+
+title Диаграмма классов — система обработки фоновых задач
+
+skinparam classAttributeIconSize 0
+left to right direction
+
+enum TaskStatus {
+    CREATED
+    IN_BUFFER
+    PROCESSING
+    COMPLETED
+    REJECTED
+}
+
+enum EventType {
+    WORKER_RELEASED
+    TASK_GENERATED
+}
+
+class Task {
+    - id: int
+    - sourceId: int
+    - priority: int
+    - createdAt: double
+    - bufferEnteredAt: double
+    - serviceStartedAt: double
+    - completedAt: double
+    - rejectedAt: double
+    - status: TaskStatus
+
+    + markBuffered(time: double): void
+    + markProcessing(time: double): void
+    + markCompleted(time: double): void
+    + markRejected(time: double): void
+}
+
+class Source {
+    - id: int
+    - priority: int
+    - minInterval: double
+    - maxInterval: double
+    - generatedCount: int
+
+    + generateTask(time: double): Task
+    + getNextGenerationTime(time: double): double
+}
+
+class Buffer {
+    - capacity: int
+    - slots: Task[]
+    - putPointer: int
+
+    + findFreeSlot(): int
+    + put(task: Task, position: int): void
+    + ejectUnderPointer(): Task
+    + hasTasks(): boolean
+    + extractHighestPriority(): Task
+    + isFull(): boolean
+}
+
+class PlacementDispatcher {
+    - buffer: Buffer
+    - selectionDispatcher: SelectionDispatcher
+    - statistics: StatisticsCollector
+
+    + placeTask(task: Task, time: double): void
+}
+
+class SelectionDispatcher {
+    - buffer: Buffer
+    - workers: Worker[]
+    - workerPointer: int
+    - eventCalendar: EventCalendar
+    - statistics: StatisticsCollector
+
+    + onTaskAdded(time: double): void
+    + onWorkerReleased(time: double): void
+    - dispatchAvailableTasks(time: double): void
+    - findFreeWorkerByRing(): Worker
+}
+
+class Worker {
+    - id: int
+    - currentTask: Task
+    - busy: boolean
+    - busyFrom: double
+    - totalBusyTime: double
+    - meanServiceTime: double
+
+    + isFree(): boolean
+    + startProcessing(task: Task, time: double): double
+    + finishProcessing(time: double): Task
+    - generateServiceDuration(): double
+}
+
+abstract class ScheduledEvent {
+    - time: double
+    - sequenceNumber: long
+
+    + getTime(): double
+    + getType(): EventType
+    + execute(engine: SimulationEngine): void
+}
+
+class TaskGeneratedEvent {
+    - source: Source
+
+    + getType(): EventType
+    + execute(engine: SimulationEngine): void
+}
+
+class WorkerReleasedEvent {
+    - worker: Worker
+    - task: Task
+
+    + getType(): EventType
+    + execute(engine: SimulationEngine): void
+}
+
+class EventCalendar {
+    - events: ScheduledEvent[]
+    - nextSequenceNumber: long
+
+    + add(event: ScheduledEvent): void
+    + next(): ScheduledEvent
+    + isEmpty(): boolean
+}
+
+class SimulationEngine {
+    - currentTime: double
+    - sources: Source[]
+    - workers: Worker[]
+    - eventCalendar: EventCalendar
+    - placementDispatcher: PlacementDispatcher
+    - selectionDispatcher: SelectionDispatcher
+    - statistics: StatisticsCollector
+
+    + initialize(): void
+    + step(): void
+    + run(untilTime: double): void
+    ~ processTaskGenerated(event: TaskGeneratedEvent): void
+    ~ processWorkerReleased(event: WorkerReleasedEvent): void
+}
+
+class StatisticsCollector {
+    - generatedCount: int
+    - rejectedCount: int
+    - completedCount: int
+    - generatedBySource: Map
+    - rejectedBySource: Map
+    - completedBySource: Map
+    - workerBusyTime: Map
+
+    + recordGenerated(task: Task): void
+    + recordRejected(task: Task): void
+    + recordServiceStart(task: Task, worker: Worker): void
+    + recordCompleted(task: Task, worker: Worker): void
+
+    + getRejectProbability(sourceId: int): double
+    + getAverageSystemTime(sourceId: int): double
+    + getAverageWaitingTime(sourceId: int): double
+    + getAverageServiceTime(sourceId: int): double
+    + getWorkerUtilization(workerId: int): double
+}
+
+ScheduledEvent <|-- TaskGeneratedEvent
+ScheduledEvent <|-- WorkerReleasedEvent
+
+TaskGeneratedEvent --> "1" Source
+WorkerReleasedEvent --> "1" Worker
+WorkerReleasedEvent --> "1" Task
+
+ScheduledEvent --> EventType
+ScheduledEvent ..> SimulationEngine : выполняется движком
+
+Source ..> Task : создаёт
+
+PlacementDispatcher --> Buffer
+PlacementDispatcher --> SelectionDispatcher : уведомляет
+PlacementDispatcher --> StatisticsCollector
+PlacementDispatcher ..> Task
+
+SelectionDispatcher --> Buffer
+SelectionDispatcher --> "1..*" Worker
+SelectionDispatcher --> EventCalendar : планирует события
+SelectionDispatcher --> StatisticsCollector
+
+Buffer "1" o-- "0..*" Task : хранит
+Worker --> "0..1" Task : обрабатывает
+
+SimulationEngine --> "1..*" Source
+SimulationEngine --> "1..*" Worker
+SimulationEngine --> EventCalendar
+SimulationEngine --> PlacementDispatcher
+SimulationEngine --> SelectionDispatcher
+SimulationEngine --> StatisticsCollector
+
+EventCalendar "1" o-- "0..*" ScheduledEvent
+
+Task --> TaskStatus
+
+note right of EventCalendar
+События упорядочиваются по следующим правилам:
+1. Сначала по возрастанию времени.
+2. При одинаковом времени освобождение worker
+   обрабатывается раньше генерации новой задачи.
+3. Если время и тип одинаковы, используется
+   порядковый номер sequenceNumber.
+
+Порядковый номер обеспечивает одинаковый
+и воспроизводимый порядок обработки событий.
+end note
+
+note bottom of Buffer
+Д1ОЗ1 — постановка по кольцу:
+поиск свободного места начинается с putPointer.
+
+Д1ОО1 — отказ под указателем:
+если буфер заполнен, задача под putPointer
+выбивается, а новая задача занимает её место.
+
+После постановки задачи putPointer
+переходит на следующую позицию.
+end note
+
+note bottom of SelectionDispatcher
+Д2Б4 — выбор одной задачи по приоритету источника:
+сначала выбирается задача источника
+с наиболее высоким приоритетом.
+
+Если приоритет одинаковый, применяется FIFO:
+выбирается задача с наименьшим bufferEnteredAt.
+
+Д2П2 — выбор worker по кольцу:
+поиск начинается с workerPointer.
+
+После назначения задачи workerPointer
+переходит на позицию после выбранного worker.
+end note
+
+note bottom of ScheduledEvent
+В календаре находятся только события,
+которые переводят модельное время вперёд:
+генерация задачи и освобождение worker.
+
+Постановка в буфер, выбивание, выбор задачи
+и начало обработки выполняются сразу
+как последствия календарного события.
+end note
+
+@enduml
